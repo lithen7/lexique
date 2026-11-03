@@ -19,6 +19,16 @@
 - 菜单里可以释放某一组的缓存与内存；再点该组即可重新加载。
 - 只读：Lexique 从不复制、也不修改你的词典文件。
 
+## 安装
+
+从 [Releases](https://github.com/Lithen7/lexique/releases) 下载 `Lexique-0.1.dmg`，拖进「应用程序」。
+
+应用是 ad-hoc 签名、未公证。首次启动若被系统拦截：右键 → 打开 → 再点「打开」，或
+
+```sh
+xattr -dr com.apple.quarantine /Applications/Lexique.app
+```
+
 ## 环境
 
 - macOS 14 及以上（在 macOS 27 / Apple Silicon 实测）。

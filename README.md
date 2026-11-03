@@ -19,6 +19,16 @@ Built because a menu-bar dictionary shouldn't need a family of background helper
 - Release a group's cache (and its memory) from the menu; click the group again to reload.
 - Read-only: Lexique never copies or modifies your dictionary files.
 
+## Install
+
+Download `Lexique-0.1.dmg` from [Releases](https://github.com/Lithen7/lexique/releases), drag it to Applications.
+
+Lexique is ad-hoc signed, not notarized. On first launch macOS may refuse it: right-click → Open, then Open again, or
+
+```sh
+xattr -dr com.apple.quarantine /Applications/Lexique.app
+```
+
 ## Requirements
 
 - macOS 14 or later (tested on macOS 27, Apple Silicon).
