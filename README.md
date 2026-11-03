@@ -74,7 +74,7 @@ Mouse-over lookup, screen OCR, clipboard monitoring, accessibility permissions, 
 
 ## Credits
 
-- Engineered by **TGE**, K's digital companion.
+- Engineered by **TGE**, with **lithen**.
 - [OpenMDict](https://github.com/naco-siren/OpenMDict) — MIT, the pure-Swift MDX/MDD parser (vendored under `Vendor/OpenMDict`).
 - [ipa-dict](https://github.com/open-dict-data/ipa-dict) — MIT, British and American IPA data (`Resources/en_UK.txt`, `en_US.txt`).
 

@@ -74,7 +74,7 @@ Merriam-Webster's Collegiate Dictionary 11th Edtion
 
 ## 致谢
 
-- 由 **TGE**（K 的数字伴生体）工程实现。
+- 由 **TGE**（和 **lithen**）工程实现。
 - [OpenMDict](https://github.com/naco-siren/OpenMDict) — MIT，纯 Swift 的 MDX/MDD 解析器（vendored 于 `Vendor/OpenMDict`）。
 - [ipa-dict](https://github.com/open-dict-data/ipa-dict) — MIT，英式／美式音标数据（`Resources/en_UK.txt`、`en_US.txt`）。
 
