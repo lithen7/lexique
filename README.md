@@ -1,5 +1,7 @@
 # Lexique
 
+English | [中文](README_CN.md)
+
 A small, fast macOS dictionary for your own MDX files. Press **⌥Space**, type a word, read the entry.
 
 Built because a menu-bar dictionary shouldn't need a family of background helpers, accessibility permissions, or an account. Lexique is one process, reads your dictionaries in place, and does nothing else.
@@ -72,6 +74,7 @@ Mouse-over lookup, screen OCR, clipboard monitoring, accessibility permissions, 
 
 ## Credits
 
+- Engineered by **TGE**, K's digital companion.
 - [OpenMDict](https://github.com/naco-siren/OpenMDict) — MIT, the pure-Swift MDX/MDD parser (vendored under `Vendor/OpenMDict`).
 - [ipa-dict](https://github.com/open-dict-data/ipa-dict) — MIT, British and American IPA data (`Resources/en_UK.txt`, `en_US.txt`).
 
