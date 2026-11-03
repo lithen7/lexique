@@ -1,0 +1,3 @@
+IPA data: open-dict-data/ipa-dict (https://github.com/open-dict-data/ipa-dict)
+License: MIT
+Files used: data/en_UK.txt, data/en_US.txt

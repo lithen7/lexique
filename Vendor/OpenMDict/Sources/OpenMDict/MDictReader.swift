@@ -1,0 +1,670 @@
+import Foundation
+import CryptoKit
+
+// MARK: - Public Types
+
+/// Word key (headword) for lookup
+public typealias MDictWordKey = String
+
+/// Article content from dictionary entry
+public struct MDictWordArticle: Sendable {
+    /// Raw HTML definition content
+    public let html: String
+    
+    // TODO: Future expansion for embedded resources
+    // public var css: MDictResource?
+    // public var images: [String: MDictResource]?
+    // public var audio: [String: MDictResource]?
+    
+    public init(html: String) {
+        self.html = html
+    }
+}
+
+/// A word entry (key-article pair) from the dictionary
+public struct MDictWordEntry: Sendable {
+    /// The headword/keyword
+    public let key: MDictWordKey
+    
+    /// The article content
+    public let article: MDictWordArticle
+    
+    /// Internal index for navigation (not exposed to users)
+    public let index: Int
+
+    /// How the entry was found when the looked-up word is not itself a key
+    /// (nil for a direct match, including case and apostrophe variants).
+    public let fallback: MDictLookupFallback?
+
+    internal init(key: MDictWordKey, article: MDictWordArticle, index: Int, fallback: MDictLookupFallback? = nil) {
+        self.key = key
+        self.article = article
+        self.index = index
+        self.fallback = fallback
+    }
+}
+
+/// The fallback that found a lookup's records when the query matched no key
+/// directly. Tried in this order (`inflection` once more at the end, for the
+/// loose base forms; see `MDictReader.lookupAll`).
+public enum MDictLookupFallback: Sendable, Hashable {
+    /// Full-width ASCII, ideographic spaces and other compatibility forms
+    /// read as their ordinary characters ("ヨハネ３：１６" finds "ヨハネ3:16",
+    /// "ﬁnd" finds "find").
+    case widthFolded
+    /// A base form of the query ("walked" finds "walk", "ging" finds "gehen").
+    case inflection(lemma: String)
+    /// Equal ignoring case and the diacritics the query lacks ("αθηναι"
+    /// finds "Ἀθῆναι", "cafe" finds "café"; "è" does not find "e").
+    case diacriticInsensitive
+}
+
+/// Which fallbacks a lookup or prefix search may use when the word is not a
+/// key (see `MDictReader.lookupAll`).
+public enum MDictLookupFallbacks: Sendable, Equatable {
+    /// Direct matches only: the word as typed, composed and trimmed, in any
+    /// case (unless the dictionary is case-sensitive) and with any apostrophe.
+    case none
+    /// Direct matches, else the word with its compatibility forms folded
+    /// (`MDictLookupFallback.widthFolded`).
+    case width
+    /// Every fallback: width folding, inflection, diacritics, loose stems.
+    case all
+}
+
+/// Lightweight dictionary metadata (can be loaded without full parsing)
+public struct MDictMetadata: Sendable {
+    /// Title from MDX header. nil if the header contains only a placeholder.
+    public let title: String?
+    public let description: String
+    /// Entry count. nil for header-only loads (call full load to get actual count).
+    public let entryCount: Int?
+    public let format: String
+    public let encoding: String
+    public let engineVersion: String
+    public let creationDate: String
+    public let isEncrypted: Bool
+    public let isCaseSensitive: Bool
+    
+    /// File path of the MDX
+    public let path: String
+    
+    /// File size in bytes
+    public let fileSize: Int64
+    
+    /// SHA256 hash of the MDX header bytes.
+    /// Used as the dictionary's unique identifier for storage and duplicate detection.
+    /// Note: This is specifically SHA256, not MD5 or any other hash algorithm.
+    public let headerSHA256: String?
+
+    /// Public memberwise initializer (the auto-synthesized one is internal).
+    public init(title: String?, description: String, entryCount: Int?, format: String,
+                encoding: String, engineVersion: String, creationDate: String,
+                isEncrypted: Bool, isCaseSensitive: Bool,
+                path: String, fileSize: Int64, headerSHA256: String?) {
+        self.title = title
+        self.description = description
+        self.entryCount = entryCount
+        self.format = format
+        self.encoding = encoding
+        self.engineVersion = engineVersion
+        self.creationDate = creationDate
+        self.isEncrypted = isEncrypted
+        self.isCaseSensitive = isCaseSensitive
+        self.path = path
+        self.fileSize = fileSize
+        self.headerSHA256 = headerSHA256
+    }
+}
+
+// MARK: - Errors
+
+public enum MDictError: Error, CustomStringConvertible {
+    case invalidHeader(String)
+    case unsupportedVersion(String)
+    case unsupportedEncryption
+    case decompressionFailed(String)
+    case invalidFormat(String)
+    case fileNotFound(String)
+    
+    public var description: String {
+        switch self {
+        case .invalidHeader(let msg): return "Invalid header: \(msg)"
+        case .unsupportedVersion(let v): return "Unsupported version: \(v)"
+        case .unsupportedEncryption: return "Record encryption (Encrypted=1,3) is not supported"
+        case .decompressionFailed(let msg): return "Decompression failed: \(msg)"
+        case .invalidFormat(let msg): return "Invalid format: \(msg)"
+        case .fileNotFound(let path): return "File not found: \(path)"
+        }
+    }
+}
+
+// MARK: - MDictReader
+
+/// MDict dictionary reader (Engine layer facade).
+/// Combines MDX parsing and MDD resource access.
+///
+/// Marked `@unchecked Sendable` — thread safety guaranteed by:
+/// - `BinaryReader.atomicRead()`: NSLock guards FileHandle seek+read
+/// - `ResourceProvider.cacheLock`: NSLock guards resource cache dictionary
+/// - `resourceLock`: NSLock guards `resources` property replacement
+/// - `parser`, `metadata`: immutable (`let`) after init
+///
+/// Usage:
+/// ```swift
+/// let reader = try MDictReader(path: "MyDict.mdx")
+/// if let entry = reader.lookup("hello") {
+///     print(entry.article.html)
+/// }
+/// let css = reader.resource(for: "style.css")
+/// ```
+public final class MDictReader: @unchecked Sendable {
+
+    // MARK: - Properties
+
+    /// Internal MDX parser
+    internal let parser: MDXParser
+
+    /// Resource provider lock — guards `_resources` property replacement
+    /// via `reloadResources(mddPaths:)`.
+    private let resourceLock = NSLock()
+
+    /// Backing storage for the resource provider.
+    /// Access through the `resources` computed property (locked).
+    private var _resources: ResourceProvider
+
+    /// Thread-safe access to the resource provider.
+    public var resources: ResourceProvider {
+        resourceLock.lock()
+        defer { resourceLock.unlock() }
+        return _resources
+    }
+
+    /// Dictionary metadata
+    public let metadata: MDictMetadata
+    
+    /// Total number of entries
+    public var entryCount: Int { parser.entryCount }
+    
+    /// All word keys (for iteration/display)
+    public var allKeys: [MDictWordKey] { parser.allKeywords }
+    
+    // MARK: - Initialization
+    
+    /// Load a dictionary from an MDX file
+    /// Automatically discovers associated MDD files and resources
+    ///
+    /// - Parameter path: Path to the .mdx file
+    /// - Throws: MDictError if the file cannot be opened or parsed
+    public init(path: String) throws {
+        guard FileManager.default.fileExists(atPath: path) else {
+            throw MDictError.fileNotFound(path)
+        }
+        
+        self.parser = try MDXParser(path: path)
+        self._resources = ResourceProvider(mdxPath: path)
+
+        // Build metadata
+        let fileSize = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64) ?? 0
+        let title = Self.resolveTitle(parser.info.title.htmlEntityDecoded)
+
+        // Compute SHA256 of header for duplicate detection
+        // Note: We read the header again here, but it's a small overhead compared to full parsing
+        let headerSHA256 = Self.computeHeaderSHA256(path: path)
+        
+        self.metadata = MDictMetadata(
+            title: title,
+            description: parser.info.description.htmlEntityDecoded,
+            entryCount: parser.entryCount,
+            format: parser.info.format,
+            encoding: parser.info.encoding,
+            engineVersion: parser.info.engineVersion,
+            creationDate: parser.info.creationDate,
+            isEncrypted: parser.info.isEncrypted,
+            isCaseSensitive: parser.info.isCaseSensitive,
+            path: path,
+            fileSize: fileSize,
+            headerSHA256: headerSHA256
+        )
+    }
+    
+    /// Load a dictionary from an MDX file with explicit MDD paths
+    /// Use this when MDD files are not in the same directory as MDX
+    ///
+    /// - Parameters:
+    ///   - path: Path to the .mdx file
+    ///   - mddPaths: Explicit paths to MDD files
+    /// - Throws: MDictError if the file cannot be opened or parsed
+    public init(path: String, mddPaths: [String]) throws {
+        guard FileManager.default.fileExists(atPath: path) else {
+            throw MDictError.fileNotFound(path)
+        }
+        
+        self.parser = try MDXParser(path: path)
+
+        // Use explicit MDD paths instead of auto-discovery
+        let mdxURL = URL(fileURLWithPath: path)
+        let baseDirectory = mdxURL.deletingLastPathComponent().path
+        self._resources = ResourceProvider(mddPaths: mddPaths, baseDirectory: baseDirectory)
+
+        // Build metadata
+        let fileSize = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64) ?? 0
+        let title = Self.resolveTitle(parser.info.title.htmlEntityDecoded)
+        let headerSHA256 = Self.computeHeaderSHA256(path: path)
+        
+        self.metadata = MDictMetadata(
+            title: title,
+            description: parser.info.description.htmlEntityDecoded,
+            entryCount: parser.entryCount,
+            format: parser.info.format,
+            encoding: parser.info.encoding,
+            engineVersion: parser.info.engineVersion,
+            creationDate: parser.info.creationDate,
+            isEncrypted: parser.info.isEncrypted,
+            isCaseSensitive: parser.info.isCaseSensitive,
+            path: path,
+            fileSize: fileSize,
+            headerSHA256: headerSHA256
+        )
+    }
+    
+    /// Reload the resource provider with new MDD paths.
+    /// Call this after adding/removing MDD files.
+    /// Thread-safe: property replacement is guarded by `resourceLock`.
+    ///
+    /// - Parameter mddPaths: New MDD paths (empty array to clear all)
+    public func reloadResources(mddPaths: [String]) {
+        let baseDirectory = (metadata.path as NSString).deletingLastPathComponent
+        let newResources = ResourceProvider(mddPaths: mddPaths, baseDirectory: baseDirectory)
+        resourceLock.lock()
+        _resources = newResources
+        resourceLock.unlock()
+    }
+    
+    // MARK: - Static Metadata Loading
+    
+    /// Load only metadata without full parsing (fast)
+    /// Useful for displaying dictionary list without loading all keywords
+    ///
+    /// - Parameter path: Path to the .mdx file
+    /// - Returns: Metadata or nil if file cannot be read
+    public static func loadMetadata(from path: String) -> MDictMetadata? {
+        guard let result = MDXParser.readHeaderOnlyWithData(path: path) else {
+            return nil
+        }
+        
+        let info = result.info
+        let fileSize = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64) ?? 0
+        let title = resolveTitle(info.title.htmlEntityDecoded)
+        
+        // Compute SHA256 hash of header bytes for duplicate detection
+        // Using SHA256 (not MD5 or other algorithms) for better collision resistance
+        let headerSHA256 = sha256Hash(of: result.headerData)
+        
+        return MDictMetadata(
+            title: title,
+            description: info.description.htmlEntityDecoded,
+            entryCount: info.entryCount,
+            format: info.format,
+            encoding: info.encoding,
+            engineVersion: info.engineVersion,
+            creationDate: info.creationDate,
+            isEncrypted: info.isEncrypted,
+            isCaseSensitive: info.isCaseSensitive,
+            path: path,
+            fileSize: fileSize,
+            headerSHA256: headerSHA256
+        )
+    }
+    
+    // MARK: - SHA256 Hash Helpers
+    
+    /// Compute SHA256 hash of MDX header bytes
+    /// Used for duplicate detection when importing dictionaries
+    private static func computeHeaderSHA256(path: String) -> String? {
+        guard let result = MDXParser.readHeaderOnlyWithData(path: path) else {
+            return nil
+        }
+        return sha256Hash(of: result.headerData)
+    }
+    
+    /// Compute SHA256 hash of data and return as lowercase hex string
+    private static func sha256Hash(of data: Data) -> String {
+        let digest = SHA256.hash(data: data)
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    // MARK: - Sidecar Cache Management
+
+    /// Delete any cached sidecar index file(s) for the given header SHA256
+    /// (the sidecar and the folded-key index saved beside it).
+    ///
+    /// Call this from the host app when a dictionary is removed so the cache
+    /// directory does not accumulate orphans. No-op if `MDictSidecarCache.cacheDirectory`
+    /// is not configured or the file does not exist.
+    public static func removeSidecarCache(forHeaderSHA256 sha256: String) {
+        guard let url = MDictSidecarCache.sidecarURL(forHeaderSHA256: sha256) else { return }
+        try? FileManager.default.removeItem(at: url)
+        try? FileManager.default.removeItem(at: FoldedIndexFile.url(forSidecar: url))
+    }
+    
+    // MARK: - Private Helpers
+    
+    /// Resolve title, falling back to filename if title is a placeholder
+    private static func resolveTitle(_ rawTitle: String) -> String? {
+        let placeholders = [
+            "Title (No HTML code allowed)",
+            "Title",
+            ""
+        ]
+        
+        let trimmed = rawTitle.trimmingCharacters(in: .whitespaces)
+        
+        if placeholders.contains(trimmed) {
+            return nil
+        }
+        
+        return rawTitle
+    }
+    
+    // MARK: - Lookup API
+    
+    /// Look up a word by key.
+    ///
+    /// When the dictionary holds several records for the word — homographs
+    /// stored as separate articles, an article plus a redirect, or (in a
+    /// case-insensitive dictionary) keys that differ only in case — their
+    /// articles are joined into one, exact-case match first, separated by
+    /// `homographSeparator`. `key` and `index` are those of the first one.
+    ///
+    /// When the word is not a key, the lookup falls back (see
+    /// `lookupAll(_:headwordLanguage:waitsForSetup:fallbacks:)`) and
+    /// `fallback` says how it matched.
+    /// - Parameters:
+    ///   - key: The word to look up
+    ///   - headwordLanguage: The dictionary's headword language (ISO 639
+    ///     code), when known — it decides which inflections are undone.
+    ///   - waitsForSetup: See `lookupAll(_:headwordLanguage:waitsForSetup:fallbacks:)`.
+    ///   - fallbacks: Which fallbacks may be used; `.none` for a direct
+    ///     lookup.
+    /// - Returns: Entry with article content, or nil if not found
+    public func lookup(_ key: MDictWordKey, headwordLanguage: String? = nil,
+                       waitsForSetup: Bool = true, fallbacks: MDictLookupFallbacks = .all) -> MDictWordEntry? {
+        let matches = lookupAll(key, headwordLanguage: headwordLanguage, waitsForSetup: waitsForSetup,
+                                fallbacks: fallbacks)
+        guard let first = matches.first else { return nil }
+        guard matches.count > 1 else { return first }
+        return MDictWordEntry(
+            key: first.key,
+            article: MDictWordArticle(html: Self.joinArticles(matches.map(\.article.html))),
+            index: first.index,
+            fallback: first.fallback
+        )
+    }
+
+    /// Whether the dictionary has the word (ignoring case, any apostrophe),
+    /// without loading any record.
+    public func contains(_ key: MDictWordKey) -> Bool {
+        parser.containsKeyword(key)
+    }
+
+    /// The record at `index`, with a redirect followed — one record, for
+    /// callers that walk the dictionary by position.
+    public func article(at index: Int) -> MDictWordEntry? {
+        guard let (key, definition, resolvedIndex) = parser.resolvedEntry(at: index) else { return nil }
+        return MDictWordEntry(key: key, article: MDictWordArticle(html: definition), index: resolvedIndex)
+    }
+
+    /// Join the articles of one word. Records of a dictionary usually repeat
+    /// the same `<script src>`, inline `<script>` and stylesheet `<link>`;
+    /// running a script once per record binds its handlers twice (a toggle
+    /// then toggles back) and re-declaring `const`/`let` throws. Such a tag
+    /// is kept only where it first appears.
+    static func joinArticles(_ articles: [String]) -> String {
+        var seen = Set<String>()
+        let pattern = #"<script\b[^>]*>[\s\S]*?</script\s*>|<link\b[^>]*>"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return articles.joined(separator: homographSeparator)
+        }
+        let deduped = articles.map { html -> String in
+            let ns = html as NSString
+            var result = ""
+            var last = 0
+            for match in regex.matches(in: html, range: NSRange(location: 0, length: ns.length)) {
+                let tag = ns.substring(with: match.range)
+                result += ns.substring(with: NSRange(location: last, length: match.range.location - last))
+                if seen.insert(tag).inserted { result += tag }
+                last = match.range.location + match.range.length
+            }
+            result += ns.substring(from: last)
+            return result
+        }
+        return deduped.joined(separator: homographSeparator)
+    }
+
+    /// Every record for a word, separately (see `lookup(_:headwordLanguage:waitsForSetup:fallbacks:)`).
+    ///
+    /// The word is composed (NFC) and trimmed first; a key equal to that
+    /// form, ignoring case (unless the dictionary is case-sensitive) and
+    /// with any apostrophe, is a direct match. When there is none, the
+    /// records of the first of these fallbacks that matches are returned,
+    /// each entry's `fallback` saying which — as far as `fallbacks` allows:
+    /// 1. full-width ASCII, ideographic spaces and other compatibility forms
+    ///    (half-width katakana, ﬁ/ﬂ ligatures) read as their ordinary
+    ///    characters;
+    /// 2. an English or German base form of the word (`InflectionCandidates`;
+    ///    a `headwordLanguage` other than English or German skips this);
+    /// 3. the keys equal to the word ignoring case and diacritics — but a
+    ///    letter the user typed with a mark only matches a key letter that
+    ///    has one ("Muller" finds "Müller", "cafè" finds "café"; "è" does
+    ///    not find "e", nor "tenía" "tenia");
+    /// 4. a loose base form: the bare stem of a comparative or of a German
+    ///    adjective or noun ending — after step 3, as these are often other
+    ///    words ("Muller" finds "Müller" in step 3, not "Mull").
+    ///
+    /// Two steps have a one-time setup: step 2's lemmatizer loads a
+    /// language's model on first use, and step 3 uses an index of the keys
+    /// with diacritics, read from its copy beside the sidecar (a few
+    /// milliseconds; see `saveFoldedKeyIndexIfNeeded`) or built the first
+    /// time a lookup or search of this dictionary needs it (up to about a
+    /// tenth of a second for half a million keys). Pass `waitsForSetup:
+    /// false` on the main thread: a lookup that needs either before it is
+    /// ready then starts it in the background and goes on without it —
+    /// until the model is loaded only the rules undo inflections, and until
+    /// the index is ready steps 3 and 4 are skipped (the lookup fails rather
+    /// than return a loose stem for a word a mark would have found). A
+    /// saved copy is always read, so a dictionary whose index the app has
+    /// saved never skips them. Steps 3 and 4 are also skipped when no copy
+    /// is saved and `MDictSidecarCache.buildsFoldedKeyIndexes` is false.
+    public func lookupAll(_ key: MDictWordKey, headwordLanguage: String? = nil,
+                          waitsForSetup: Bool = true, fallbacks: MDictLookupFallbacks = .all) -> [MDictWordEntry] {
+        let (records, fallback) = parser.lookupAllWithFallbacks(key, headwordLanguage: headwordLanguage,
+                                                                waitsForSetup: waitsForSetup, fallbacks: fallbacks)
+        return records.map { originalKey, definition, index in
+            MDictWordEntry(
+                key: originalKey,  // Use original key from dictionary
+                article: MDictWordArticle(html: definition),
+                index: index,
+                fallback: fallback
+            )
+        }
+    }
+
+    /// Placed between the articles of a word that has several records.
+    /// The app styles `hr.omdict-homograph-separator`.
+    public static let homographSeparator = "\n<hr class=\"omdict-homograph-separator\">\n"
+    
+    /// Access entry by index
+    /// - Parameter index: Index in keyword list
+    /// - Returns: Entry or nil if out of bounds
+    public subscript(index: Int) -> MDictWordEntry? {
+        guard let (keyword, definition) = parser.entryAt(index) else {
+            return nil
+        }
+        return MDictWordEntry(
+            key: keyword,
+            article: MDictWordArticle(html: definition),
+            index: index
+        )
+    }
+
+    /// A reader of records by index for walking the keys in order (see
+    /// `MDictRecordWalker`).
+    public func recordWalker() -> MDictRecordWalker {
+        MDictRecordWalker(parser: parser)
+    }
+    
+    // MARK: - Search API
+    
+    /// Search for word keys with a prefix. When no key has the prefix, keys
+    /// with it in full-width-folded form, then ignoring case and diacritics
+    /// (those the prefix lacks), are returned.
+    /// - Parameters:
+    ///   - prefix: Prefix to match
+    ///   - limit: Maximum results (default 20)
+    ///   - waitsForSetup: As in `lookupAll(_:headwordLanguage:waitsForSetup:fallbacks:)`.
+    /// - Returns: Array of matching word keys
+    public func search(prefix: String, limit: Int = 20, waitsForSetup: Bool = true) -> [MDictWordKey] {
+        parser.search(prefix: prefix, limit: limit, waitsForSetup: waitsForSetup)
+    }
+
+    /// `search(prefix:limit:waitsForSetup:)`, with the fallback that found
+    /// the keys: nil when they start with the prefix as typed (composed and
+    /// trimmed), `.widthFolded` or `.diacriticInsensitive` otherwise. A
+    /// search never mixes the two: keys found directly are returned alone.
+    /// `fallbacks` limits the fallbacks tried, as in `lookupAll` (`.none`
+    /// for the keys with the prefix as typed only). The diacritic fallback
+    /// is skipped when the folded-key index is not available (see
+    /// `lookupAll`).
+    public func searchWithFallback(prefix: String, limit: Int = 20, waitsForSetup: Bool = true,
+                                   fallbacks: MDictLookupFallbacks = .all)
+        -> (keys: [MDictWordKey], fallback: MDictLookupFallback?) {
+        parser.searchWithFallback(prefix: prefix, limit: limit, waitsForSetup: waitsForSetup, fallbacks: fallbacks)
+    }
+
+    /// Build the index behind diacritic-insensitive matching now instead of
+    /// on the first lookup or search that needs it (regardless of
+    /// `MDictSidecarCache.buildsFoldedKeyIndexes`). Safe to call from any
+    /// thread, and more than once. Returns the number of keys it holds (keys
+    /// whose folded form differs from their lowercase form).
+    @discardableResult
+    public func prepareFoldedKeyIndex() -> Int {
+        parser.foldedKeyIndex().indices.count
+    }
+
+    /// Save the index behind diacritic-insensitive matching beside the
+    /// sidecar if no valid copy is there, without keeping it in memory, so
+    /// the first lookup that needs it — in this process or in one that never
+    /// writes, such as an extension — reads it (a few milliseconds at most)
+    /// instead of building it. For a background pass after loading; blocks
+    /// while it builds. No-op without a sidecar cache, with
+    /// `MDictSidecarCache.writeMode == .disabled`, when a copy exists, or
+    /// when the MDX at this reader's path has been replaced since the
+    /// reader opened it (the new file's reader saves its own).
+    public func saveFoldedKeyIndexIfNeeded() {
+        parser.saveFoldedKeyIndexIfNeeded()
+    }
+    
+    /// Get suggestions for a misspelled word
+    /// - Parameters:
+    ///   - key: The word to find suggestions for
+    ///   - limit: Maximum suggestions
+    ///   - waitsForSetup: As in `lookupAll(_:headwordLanguage:waitsForSetup:fallbacks:)`
+    ///     (candidates come from prefix searches, which fall back to folding).
+    /// - Returns: Array of scored suggestions, closest matches first
+    public func suggestions(for key: MDictWordKey, limit: Int = 5, waitsForSetup: Bool = true) -> [ScoredSuggestion] {
+        parser.suggestions(for: key, limit: limit, waitsForSetup: waitsForSetup)
+    }
+    
+    // MARK: - Resource API
+    
+    /// Get a resource (CSS, image, audio, etc.)
+    /// - Parameter path: Resource path
+    /// - Returns: Resource data or nil
+    public func resource(for path: String) -> Data? {
+        resources.resource(for: path)
+    }
+    
+    /// Get a resource as string
+    /// - Parameters:
+    ///   - path: Resource path
+    ///   - encoding: String encoding (default UTF-8)
+    /// - Returns: Resource as string or nil
+    public func resourceString(for path: String, encoding: String.Encoding = .utf8) -> String? {
+        resources.string(for: path, encoding: encoding)
+    }
+    
+    /// Check if a resource exists
+    public func hasResource(_ path: String) -> Bool {
+        resources.contains(path)
+    }
+    
+    /// Number of resources in MDD files
+    public var resourceCount: Int {
+        resources.mddResourceCount
+    }
+    
+    /// All resource paths from MDD files
+    public var allResourcePaths: [String] {
+        resources.allMDDPaths
+    }
+    
+    // MARK: - Debug API
+    
+    /// Read raw header XML for debugging
+    /// - Parameter path: Path to the .mdx file
+    /// - Returns: Tuple of (encoding description, raw XML string) or nil if file cannot be read
+    public static func readRawHeader(from path: String) -> (encoding: String, xml: String)? {
+        guard let reader = try? BinaryReader(path: path) else { return nil }
+        
+        do {
+            let headerLen = try reader.readUInt32BE()
+            let headerData = try reader.readBytes(Int(headerLen))
+            
+            let headerStr: String
+            let encoding: String
+            
+            if headerData.count >= 2 && headerData[0] == 0xFF && headerData[1] == 0xFE {
+                headerStr = String(data: Data(headerData), encoding: .utf16LittleEndian) ?? ""
+                encoding = "UTF-16LE (BOM detected)"
+            } else if headerData.count >= 2 && headerData.suffix(2) == Data([0x00, 0x00]) {
+                headerStr = String(data: Data(headerData.dropLast(2)), encoding: .utf16LittleEndian) ?? ""
+                encoding = "UTF-16LE (null-terminated)"
+            } else {
+                headerStr = String(data: Data(headerData), encoding: .utf8) ?? ""
+                encoding = "UTF-8"
+            }
+            
+            return (encoding, headerStr)
+        } catch {
+            return nil
+        }
+    }
+}
+
+/// Reads records by index like `MDictReader[index]`, but keeps the most
+/// recently decompressed record block. Records are stored in key order, so
+/// a walk over `0..<entryCount` decompresses each record block once, where
+/// the subscript decompresses the block again for every record. Holds one
+/// block in memory. Not thread-safe: use one walker per walk.
+public final class MDictRecordWalker {
+    private let parser: MDXParser
+    private let cache = MDXParser.BlockCache(capacity: 1)
+
+    init(parser: MDXParser) {
+        self.parser = parser
+    }
+
+    /// The record stored at `index` (no redirect followed), or nil if out
+    /// of bounds or unreadable.
+    public subscript(index: Int) -> MDictWordEntry? {
+        guard let (keyword, definition) = parser.entryAt(index, cache: cache) else {
+            return nil
+        }
+        return MDictWordEntry(
+            key: keyword,
+            article: MDictWordArticle(html: definition),
+            index: index
+        )
+    }
+}
